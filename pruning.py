@@ -306,7 +306,20 @@ def run(samples, model, alpha, beta, gamma, top, checkpoint=False) -> Dict[str, 
     scores = scorer.score(alpha, beta, gamma)
     for group, s in scores.items():
         _print_ranking(group, s.cpu(), scorer.n_heads, scorer.inter, top)
-    return scores
+    return scores, scorer.n_heads, scorer.inter, scorer.n_layers
+
+
+def save_scores(path, scores, n_heads, inter, n_layers):
+    """Dump per-unit scores to JSON for prune.py to consume."""
+    import json
+
+    out = {
+        "meta": {"n_heads": n_heads, "intermediate_size": inter, "n_layers": n_layers},
+        "scores": {g: s.cpu().tolist() for g, s in scores.items()},
+    }
+    with open(path, "w") as f:
+        json.dump(out, f)
+    print(f"scores saved to {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +469,7 @@ def demo() -> None:
             for _ in range(3)
         ]
 
-    scores = run(make_samples(), model, alpha=1.0, beta=1.0, gamma=1.0, top=5)
+    scores = run(make_samples(), model, alpha=1.0, beta=1.0, gamma=1.0, top=5)[0]
 
     assert set(scores) == {"heads", "neurons", "layers"}, scores.keys()
     assert scores["heads"].numel() == cfg.num_hidden_layers * cfg.num_attention_heads
@@ -473,7 +486,7 @@ def demo() -> None:
     for p in model2.parameters():
         p.requires_grad_(True)
     scores_ck = run(make_samples(), model2, alpha=1.0, beta=1.0, gamma=1.0, top=5,
-                    checkpoint=True)
+                    checkpoint=True)[0]
     for g in scores:
         assert torch.allclose(scores[g], scores_ck[g], atol=1e-4), f"{g} ckpt mismatch"
     print("\ndemo OK (checkpoint path matches)")
@@ -493,6 +506,7 @@ def main() -> None:
     ap.add_argument("--beta", type=float, default=1.0)
     ap.add_argument("--gamma", type=float, default=1.0)
     ap.add_argument("--top", type=int, default=20)
+    ap.add_argument("--out", help="save per-unit scores to this JSON (for prune.py)")
     ap.add_argument("--checkpoint", action="store_true",
                     help="gradient checkpointing: ~5-10x less VRAM, ~30%% slower")
     ap.add_argument("--demo", action="store_true")
@@ -508,7 +522,11 @@ def main() -> None:
         samples = load_samples_glob(args.images, device, args.max_images, args.max_side)
     else:
         samples = load_samples_hf(args.dataset, args.split, device, args.max_images, args.max_side)
-    run(samples, model, args.alpha, args.beta, args.gamma, args.top, args.checkpoint)
+    scores, n_heads, inter, n_layers = run(
+        samples, model, args.alpha, args.beta, args.gamma, args.top, args.checkpoint
+    )
+    if args.out:
+        save_scores(args.out, scores, n_heads, inter, n_layers)
 
 
 if __name__ == "__main__":
