@@ -128,61 +128,104 @@ class Scorer:
         self.neurons: Optional[GroupStats] = None
         self.layers: Optional[GroupStats] = None
 
-        self._head_act: List[Tensor] = []
-        self._neuron_act: List[Tensor] = []
-        self._layer_act: List[Tensor] = []
+        # per-block captures, keyed by block index, refreshed every step.
+        # act = activation tensor (forward), grad = its gradient (backward).
+        self._act: Dict[str, List[Optional[Tensor]]] = {}
+        self._grad: Dict[str, List[Optional[Tensor]]] = {}
         self._handles: List = []
 
     def attach(self) -> None:
-        for block in self.model.encoder.blocks:
+        n = self.n_layers
+        for group in ("heads", "neurons", "layers"):
+            self._act[group] = [None] * n
+            self._grad[group] = [None] * n
+
+        for i, block in enumerate(self.model.encoder.blocks):
+            # heads: input to wo, reshaped (L, n_heads, head_dim)
             self._handles.append(
-                block.wo.register_forward_pre_hook(
-                    lambda _m, inp: self._head_act.append(
-                        self._keep(inp[0].view(inp[0].shape[0], self.n_heads, self.head_dim))
-                    )
-                )
+                block.wo.register_forward_pre_hook(self._fwd("heads", i, reshape=True))
             )
             self._handles.append(
-                block.mlp.fc1.register_forward_pre_hook(
-                    lambda _m, inp: self._neuron_act.append(self._keep(inp[0]))
-                )
+                block.wo.register_full_backward_pre_hook(self._bwd("heads", i, reshape=True))
+            )
+            # neurons: input to mlp.fc1 (FFN hidden, after activation)
+            self._handles.append(
+                block.mlp.fc1.register_forward_pre_hook(self._fwd("neurons", i))
             )
             self._handles.append(
-                block.register_forward_hook(
-                    lambda _m, _i, out: self._layer_act.append(self._keep(out))
-                )
+                block.mlp.fc1.register_full_backward_pre_hook(self._bwd("neurons", i))
+            )
+            # layers: block output (residual stream)
+            self._handles.append(
+                block.register_forward_hook(self._fwd_out("layers", i))
+            )
+            self._handles.append(
+                block.register_full_backward_hook(self._bwd_out("layers", i))
             )
 
-    @staticmethod
-    def _keep(t: Tensor) -> Tensor:
-        t.retain_grad()
-        return t
+    def _reshape_heads(self, t: Tensor) -> Tensor:
+        return t.view(t.shape[0], self.n_heads, self.head_dim)
+
+    def _fwd(self, group, i, reshape=False):
+        def hook(_m, inp):
+            t = inp[0]
+            self._act[group][i] = self._reshape_heads(t).detach() if reshape else t.detach()
+        return hook
+
+    def _fwd_out(self, group, i):
+        def hook(_m, _inp, out):
+            self._act[group][i] = out.detach()
+        return hook
+
+    def _bwd(self, group, i, reshape=False):
+        # full_backward_pre_hook gives grad_output (tuple) for the module input side
+        def hook(_m, grad_out):
+            g = grad_out[0]
+            self._grad[group][i] = self._reshape_heads(g) if reshape else g
+        return hook
+
+    def _bwd_out(self, group, i):
+        def hook(_m, _gi, grad_out):
+            self._grad[group][i] = grad_out[0]
+        return hook
 
     def detach(self) -> None:
         for h in self._handles:
             h.remove()
         self._handles.clear()
 
-    def step(self, pixel_values: Tensor, grid_hws: Tensor) -> None:
-        self._head_act.clear()
-        self._neuron_act.clear()
-        self._layer_act.clear()
+    def enable_checkpointing(self) -> None:
+        """Wrap each encoder block in torch checkpoint to cut backward memory.
 
+        use_reentrant=False keeps module forward/backward hooks firing once
+        each. We read activations via forward hooks and gradients via module
+        backward hooks (NOT retain_grad on internal tensors, which checkpoint
+        discards) — so Fisher stays correct under recompute."""
+        from torch.utils.checkpoint import checkpoint
+
+        for block in self.model.encoder.blocks:
+            inner = block.forward
+
+            def wrapped(*a, _inner=inner, **k):
+                return checkpoint(_inner, *a, use_reentrant=False, **k)
+
+            block.forward = wrapped
+
+    def step(self, pixel_values: Tensor, grid_hws: Tensor) -> None:
         self.model.zero_grad(set_to_none=True)
         out = self.model(pixel_values, grid_hws)
         # forward returns a list of per-image merged tensors; energy = sum of L2^2
         loss = sum(t.float().pow(2).sum() for t in out)
         loss.backward()
 
-        self._accumulate(self._head_act, "heads")
-        self._accumulate(self._neuron_act, "neurons")
-        self._accumulate(self._layer_act, "layers")
+        for group in ("heads", "neurons", "layers"):
+            self._accumulate(group)
 
-    def _accumulate(self, captured: List[Tensor], group: str) -> None:
+    def _accumulate(self, group: str) -> None:
         acts, fishers, feats = [], [], []
-        for t in captured:
-            td = t.detach().float()
-            grad = t.grad.float() if t.grad is not None else torch.zeros_like(td)
+        for t, g in zip(self._act[group], self._grad[group]):
+            td = t.float()
+            grad = g.float() if g is not None else torch.zeros_like(td)
             if group == "heads":          # t: (L, n_heads, head_dim)
                 a = td.norm(dim=2).mean(dim=0)              # (n_heads,)
                 f = (td * grad).pow(2).sum(dim=(0, 2))      # (n_heads,)
@@ -247,8 +290,10 @@ def _print_ranking(group: str, score: Tensor, n_heads: int, inter: int, top: int
         print(f"  #{rank:>3}  score={score[idx]:+.3f}  {loc}")
 
 
-def run(samples, model, alpha, beta, gamma, top) -> Dict[str, Tensor]:
+def run(samples, model, alpha, beta, gamma, top, checkpoint=False) -> Dict[str, Tensor]:
     scorer = Scorer(model)
+    if checkpoint:
+        scorer.enable_checkpointing()
     scorer.attach()
     try:
         for i, (pv, gh) in enumerate(samples):
@@ -404,11 +449,13 @@ def demo() -> None:
     for p in model.parameters():
         p.requires_grad_(True)
 
-    samples = [
-        (torch.randn(20, cfg.hidden_size), torch.tensor([[4, 5]], dtype=torch.int32))
-        for _ in range(3)
-    ]
-    scores = run(samples, model, alpha=1.0, beta=1.0, gamma=1.0, top=5)
+    def make_samples():
+        return [
+            (torch.randn(20, cfg.hidden_size), torch.tensor([[4, 5]], dtype=torch.int32))
+            for _ in range(3)
+        ]
+
+    scores = run(make_samples(), model, alpha=1.0, beta=1.0, gamma=1.0, top=5)
 
     assert set(scores) == {"heads", "neurons", "layers"}, scores.keys()
     assert scores["heads"].numel() == cfg.num_hidden_layers * cfg.num_attention_heads
@@ -417,7 +464,18 @@ def demo() -> None:
     for g, s in scores.items():
         assert torch.isfinite(s).all(), f"{g} non-finite"
         assert abs(s.mean().item()) < 1e-3, f"{g} mean off: {s.mean()}"
-    print("\ndemo OK")
+
+    # checkpointing must produce the SAME scores (same seed) — verifies the
+    # backward-hook Fisher path matches the plain path under recompute.
+    torch.manual_seed(0)
+    model2 = _FakeModel(cfg).eval()
+    for p in model2.parameters():
+        p.requires_grad_(True)
+    scores_ck = run(make_samples(), model2, alpha=1.0, beta=1.0, gamma=1.0, top=5,
+                    checkpoint=True)
+    for g in scores:
+        assert torch.allclose(scores[g], scores_ck[g], atol=1e-4), f"{g} ckpt mismatch"
+    print("\ndemo OK (checkpoint path matches)")
 
 
 def main() -> None:
@@ -434,6 +492,8 @@ def main() -> None:
     ap.add_argument("--beta", type=float, default=1.0)
     ap.add_argument("--gamma", type=float, default=1.0)
     ap.add_argument("--top", type=int, default=20)
+    ap.add_argument("--checkpoint", action="store_true",
+                    help="gradient checkpointing: ~5-10x less VRAM, ~30%% slower")
     ap.add_argument("--demo", action="store_true")
     args = ap.parse_args()
 
@@ -447,7 +507,7 @@ def main() -> None:
         samples = load_samples_glob(args.images, device, args.max_images, args.max_side)
     else:
         samples = load_samples_hf(args.dataset, args.split, device, args.max_images, args.max_side)
-    run(samples, model, args.alpha, args.beta, args.gamma, args.top)
+    run(samples, model, args.alpha, args.beta, args.gamma, args.top, args.checkpoint)
 
 
 if __name__ == "__main__":
