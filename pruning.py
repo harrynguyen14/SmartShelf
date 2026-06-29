@@ -146,14 +146,14 @@ class Scorer:
                 block.wo.register_forward_pre_hook(self._fwd("heads", i, reshape=True))
             )
             self._handles.append(
-                block.wo.register_full_backward_pre_hook(self._bwd("heads", i, reshape=True))
+                block.wo.register_full_backward_hook(self._bwd("heads", i, reshape=True))
             )
             # neurons: input to mlp.fc1 (FFN hidden, after activation)
             self._handles.append(
                 block.mlp.fc1.register_forward_pre_hook(self._fwd("neurons", i))
             )
             self._handles.append(
-                block.mlp.fc1.register_full_backward_pre_hook(self._bwd("neurons", i))
+                block.mlp.fc1.register_full_backward_hook(self._bwd("neurons", i))
             )
             # layers: block output (residual stream)
             self._handles.append(
@@ -178,9 +178,10 @@ class Scorer:
         return hook
 
     def _bwd(self, group, i, reshape=False):
-        # full_backward_pre_hook gives grad_output (tuple) for the module input side
-        def hook(_m, grad_out):
-            g = grad_out[0]
+        # full_backward_hook gives grad_input — grad wrt the module's INPUT,
+        # which matches the activation captured by the forward PRE hook.
+        def hook(_m, grad_in, _go):
+            g = grad_in[0]
             self._grad[group][i] = self._reshape_heads(g) if reshape else g
         return hook
 
