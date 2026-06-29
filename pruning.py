@@ -295,23 +295,32 @@ def load_real_model(device):
 DEFAULT_HF_DATASET = "harryrobert/SKU-110k-reformat"
 
 
-def _pil_to_sample(img, device):
+def _pil_to_sample(img, device, max_side):
+    """Resize so the long edge <= max_side BEFORE patchify, capping sequence
+    length. Attention here builds a dense (L, L) mask, so L must stay modest:
+    a 3024px image -> ~46k patches -> 8 GB mask (OOM). max_side=1024 -> ~3k
+    patches -> ~36 MB. Importance ranking is stable at reduced resolution."""
     import torchvision.transforms.functional as TF
 
-    patches, (gh, gw) = image_to_patches(TF.to_tensor(img.convert("RGB")))
+    img = img.convert("RGB")
+    w, h = img.size
+    if max(w, h) > max_side:
+        scale = max_side / max(w, h)
+        img = img.resize((round(w * scale), round(h * scale)))
+    patches, (gh, gw) = image_to_patches(TF.to_tensor(img))
     pv = patches.to(device).float()
     ghw = torch.tensor([[gh, gw]], device=device, dtype=torch.int32)
     return pv, ghw
 
 
-def load_samples_hf(repo, split, device, max_images):
+def load_samples_hf(repo, split, device, max_images, max_side):
     """Load images from the HF Hub dataset (harryrobert/SKU-110k-reformat)."""
     from datasets import load_dataset
 
     ds = load_dataset(repo, split=split, streaming=True)
     samples = []
     for ex in ds:
-        samples.append(_pil_to_sample(ex["image"], device))
+        samples.append(_pil_to_sample(ex["image"], device, max_side))
         if len(samples) >= max_images:
             break
     if not samples:
@@ -319,13 +328,13 @@ def load_samples_hf(repo, split, device, max_images):
     return samples
 
 
-def load_samples_glob(patterns, device, max_images):
+def load_samples_glob(patterns, device, max_images, max_side):
     from PIL import Image
 
     paths = sorted(p for pat in patterns for p in glob.glob(pat))[:max_images]
     if not paths:
         raise SystemExit(f"no images matched: {patterns}")
-    return [_pil_to_sample(Image.open(p), device) for p in paths]
+    return [_pil_to_sample(Image.open(p), device, max_side) for p in paths]
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +428,8 @@ def main() -> None:
     ap.add_argument("--images", nargs="+",
                     help="glob(s) for local images (overrides --dataset)")
     ap.add_argument("--max-images", type=int, default=64)
+    ap.add_argument("--max-side", type=int, default=1024,
+                    help="resize long edge to this before patchify (caps L, avoids OOM)")
     ap.add_argument("--alpha", type=float, default=1.0)
     ap.add_argument("--beta", type=float, default=1.0)
     ap.add_argument("--gamma", type=float, default=1.0)
@@ -433,9 +444,9 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_real_model(device)
     if args.images:
-        samples = load_samples_glob(args.images, device, args.max_images)
+        samples = load_samples_glob(args.images, device, args.max_images, args.max_side)
     else:
-        samples = load_samples_hf(args.dataset, args.split, device, args.max_images)
+        samples = load_samples_hf(args.dataset, args.split, device, args.max_images, args.max_side)
     run(samples, model, args.alpha, args.beta, args.gamma, args.top)
 
 
