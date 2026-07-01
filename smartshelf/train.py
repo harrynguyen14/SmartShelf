@@ -13,8 +13,10 @@ from ultralytics import YOLO
 SRC = r"D:/industry-item-dataset/SKU110K/SKU110K_fixed"
 DATA = os.path.join(SRC, "yolo", "data.yaml")
 
-# SKU110K vat nho day dac -> imgsz cao. Chinh xuong neu GPU het VRAM.
-IMGSZ = 960
+# SKU110K anh that ~2448x3264 (da dang, doc), vat nho day dac -> imgsz cao.
+# 1280 giu ~2x chi tiet vat nho so voi 960; vat nho con lai de tiling o inference
+# ganh. Tang 1536 neu recall thieu; giam batch neu OOM.
+IMGSZ = 1280
 EPOCHS = 100
 BATCH = 16          # giam neu OOM
 MODEL = "yolo11n.pt"   # nano cho edge Pi
