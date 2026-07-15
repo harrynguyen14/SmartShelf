@@ -14,8 +14,8 @@ def main():
     ap.add_argument("--data", default="d2s_yolo/data.yaml")
     ap.add_argument("--model", default="yolo11s-seg.pt")  # n/s/m/l/x-seg
     ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--imgsz", type=int, default=960)  # D2S imgs are 1920x1440; 960 keeps small labels legible
-    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--imgsz", type=int, default=1280)  # 1280 keeps small-label text legible (tea/coffee classes)
+    ap.add_argument("--batch", type=int, default=16)  # seg is heavier than detect; use -1 (autobatch) if OOM at 1280
     ap.add_argument("--device", default=0)  # 0 for GPU, "cpu" otherwise
     ap.add_argument("--project", default="runs")
     ap.add_argument("--name", default="d2s_seg")
