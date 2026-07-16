@@ -13,9 +13,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="d2s_yolo/data.yaml")
     ap.add_argument("--model", default="yolo11s-seg.pt")  # n/s/m/l/x-seg
-    ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--imgsz", type=int, default=1280)  # 1280 keeps small-label text legible (tea/coffee classes)
-    ap.add_argument("--batch", type=int, default=16)  # seg is heavier than detect; use -1 (autobatch) if OOM at 1280
+    ap.add_argument("--epochs", type=int, default=150)
+    ap.add_argument("--imgsz", type=int, default=1280)  # 960 fits seg on a 15GB T4; 1280 needs P100/A100
+    ap.add_argument("--batch", type=int, default=16)  # T4 @960 OK; for 1280 use bigger GPU or --batch 4
     ap.add_argument("--device", default=0)  # 0 for GPU, "cpu" otherwise
     ap.add_argument("--project", default="runs")
     ap.add_argument("--name", default="d2s_seg")
@@ -27,6 +27,10 @@ def main():
     ap.add_argument("--scale", type=float, default=0.5)      # near/far distance
     ap.add_argument("--hsv_v", type=float, default=0.5)      # store lighting variance
     ap.add_argument("--close_mosaic", type=int, default=15)  # drop mosaic last N epochs to fine-tune real layouts
+    # D2S train = 1 object/img, val = 4.4 objects/img with occlusion. copy_paste pastes
+    # instances into scenes -> simulates the crowded multi-object val, the main recall gap.
+    ap.add_argument("--copy_paste", type=float, default=0.4)
+    ap.add_argument("--patience", type=int, default=50)  # early-stop after 50 epochs w/o val improvement
     args = ap.parse_args()
 
     YOLO(args.model).train(
@@ -34,6 +38,7 @@ def main():
         device=args.device, project=args.project, name=args.name,
         degrees=args.degrees, flipud=args.flipud, perspective=args.perspective,
         scale=args.scale, hsv_v=args.hsv_v, close_mosaic=args.close_mosaic,
+        copy_paste=args.copy_paste, patience=args.patience,
     )
 
 
